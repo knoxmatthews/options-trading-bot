@@ -24,11 +24,14 @@ class OptionsBot:
             "portfolio_value": float(account.portfolio_value)
         }
 
-    def get_signal(self, symbol: str):
+        def get_signal(self, symbol: str):
         """Momentum signal using SMA crossover"""
         try:
+            # Fixed version for current Alpaca SDK
             bars = self.data_client.get_stock_bars(
-                symbol, TimeFrame.Minute, limit=150
+                symbol, 
+                TimeFrame.Minute,
+                start=datetime.now() - timedelta(minutes=200)
             ).df
             
             if len(bars) < 50:
@@ -44,7 +47,6 @@ class OptionsBot:
         except Exception as e:
             print(f"Error getting signal for {symbol}: {e}")
         return None
-
     def find_best_contract(self, underlying: str, option_type: str = "call", days_max: int = 14):
         """Find closest to ATM contract"""
         try:
