@@ -1,0 +1,4 @@
+alpaca-py
+pandas
+TA-Lib
+python-dotenv
