@@ -6,28 +6,26 @@ import talib
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data import StockHistoricalDataClient, TimeFrame
 
 class OptionsBot:
     def __init__(self, api_key: str, api_secret: str, paper: bool = True):
         self.client = TradingClient(api_key, api_secret, paper=paper)
         self.data_client = StockHistoricalDataClient(api_key, api_secret)
-        self.underlyings = ["SPY", "SPX", "QQQ", "AAPL", "TSLA", "NVDA"]  # Add more here
-        self.risk_percent = 0.05  # % of buying power per trade (conservative for testing)
+        self.underlyings = ["SPY", "SPX", "QQQ", "AAPL", "TSLA", "NVDA"]
+        self.risk_percent = 0.05
 
     def get_account_info(self):
         account = self.client.get_account()
         return {
             "buying_power": float(account.buying_power),
-            "cash": float(account.cash),
             "portfolio_value": float(account.portfolio_value)
         }
 
-        def get_signal(self, symbol: str):
+    def get_signal(self, symbol: str):
         """Momentum signal using SMA crossover"""
         try:
-            # Fixed version for current Alpaca SDK
             bars = self.data_client.get_stock_bars(
                 symbol, 
                 TimeFrame.Minute,
@@ -47,28 +45,26 @@ class OptionsBot:
         except Exception as e:
             print(f"Error getting signal for {symbol}: {e}")
         return None
+
     def find_best_contract(self, underlying: str, option_type: str = "call", days_max: int = 14):
-        """Find closest to ATM contract"""
         try:
             req = GetOptionContractsRequest(
                 underlying_symbols=[underlying],
                 type=option_type,
                 expiration_date_gte=datetime.now().date(),
                 expiration_date_lte=(datetime.now() + timedelta(days=days_max)).date(),
-                limit=200
+                limit=100
             )
             contracts = self.client.get_option_contracts(req)
             
             if not contracts:
                 return None
                 
-            # Get latest price for better ATM selection
             latest = self.data_client.get_latest_quote(underlying)
-            price = (latest.ask_price + latest.bid_price) / 2 if latest else 450  # fallback
+            price = (latest.ask_price + latest.bid_price) / 2 if latest else 450
             
-            # Sort by closeness to ATM
             best = min(contracts, key=lambda c: abs(float(c.strike_price) - price))
-            print(f"Selected {option_type.upper()} {best.symbol} | Strike: {best.strike_price} | Price: ~{price}")
+            print(f"Selected {option_type.upper()} {best.symbol} | Strike: {best.strike_price}")
             return best
         except Exception as e:
             print(f"Contract search error for {underlying}: {e}")
@@ -110,25 +106,24 @@ class OptionsBot:
                 if contract:
                     self.place_order(contract.symbol, "buy")
 
-# ====================== MAIN ======================
 if __name__ == "__main__":
     api_key = os.getenv("ALPACA_KEY")
     api_secret = os.getenv("ALPACA_SECRET")
     
     if not api_key or not api_secret:
-        print("❌ Missing ALPACA_KEY or ALPACA_SECRET environment variables!")
+        print("❌ Missing ALPACA_KEY or ALPACA_SECRET!")
         exit(1)
     
     bot = OptionsBot(api_key, api_secret, paper=True)
-    
     print("🤖 Options Bot Started (Paper Trading)")
+    
     while True:
         try:
             bot.run_scan()
             print("💤 Sleeping 15 minutes...\n")
-            time.sleep(900)  # 15 minutes
+            time.sleep(900)
         except KeyboardInterrupt:
-            print("Bot stopped by user.")
+            print("Bot stopped.")
             break
         except Exception as e:
             print(f"Unexpected error: {e}")
