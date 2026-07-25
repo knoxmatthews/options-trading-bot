@@ -31,6 +31,7 @@ GitHub Actions secrets needed: FASTBALL_API_KEY, FASTBALL_API_SECRET
 """
 
 import os
+import time
 import logging
 import datetime
 from datetime import timedelta, timezone
@@ -375,33 +376,29 @@ class FastballBot:
 
     # ── main ─────────────────────────────────────────────────────────────────
 
-    def run(self):
+    def scan_cycle(self):
+        """One full cycle: check exits, then look for a new entry if flat."""
         now = datetime.datetime.now(ET)
-        log.info(f"━━ Scan {now.strftime('%Y-%m-%d %H:%M ET')} ━━")
 
         if not self.is_market_open():
-            log.info("Market closed — skipping.")
-            return
+            return "closed"
 
         if not self.past_open_buffer():
-            log.info("Within first 5min of open — skipping (spreads too wide).")
-            return
+            return "open_buffer"
 
         # Always check exits first, regardless of anything else
         self.monitor_exit()
 
         # One position at a time - if already holding, don't open another
         if self.get_open_option_positions():
-            log.info("Already holding a position — no new entry this cycle.")
-            return
+            return "holding"
 
         if not self.before_late_cutoff():
-            log.info("After 3:45pm — no new entries today.")
-            return
+            return "late_cutoff"
 
         df = self.get_bars()
         if df is None:
-            return
+            return "no_data"
 
         signal, reason = get_signal(df)
         log.info(f"Signal: {signal or 'none'} | {reason}")
@@ -410,13 +407,77 @@ class FastballBot:
             self.place_trade("call", reason)
         elif signal == "sell":
             self.place_trade("put", reason)
-        else:
-            log.info("No trade this cycle.")
+
+        return "scanned"
+
+    def run_once(self):
+        """Single cycle then exit - used for manual/cron-triggered runs."""
+        now = datetime.datetime.now(ET)
+        log.info(f"━━ Scan {now.strftime('%Y-%m-%d %H:%M ET')} ━━")
+        status = self.scan_cycle()
+        log.info(f"Cycle result: {status}")
+
+    def run_forever(self):
+        """
+        Persistent loop for Railway (or any always-on host).
+        Exits are checked every EXIT_CHECK_SECONDS - much faster reaction
+        than a cron-triggered bot can offer, since a bad move against an
+        open position doesn't have to wait for the next scheduled trigger.
+        New-entry signal scanning runs on a slower cadence since it's tied
+        to 5-min bar data that doesn't change meaningfully faster than that.
+        """
+        EXIT_CHECK_SECONDS  = 30    # fast - protects an open position
+        ENTRY_SCAN_SECONDS  = 300   # 5 min - matches the bar timeframe
+
+        log.info(f"Fastball Bot starting persistent loop | exit checks every {EXIT_CHECK_SECONDS}s, entry scans every {ENTRY_SCAN_SECONDS}s")
+        last_entry_scan = None
+
+        while True:
+            try:
+                now = datetime.datetime.now(ET)
+
+                if not self.is_market_open():
+                    log.info("Market closed — sleeping 60s.")
+                    time.sleep(60)
+                    continue
+
+                if self.past_open_buffer():
+                    self.monitor_exit()
+
+                do_entry_scan = (
+                    last_entry_scan is None
+                    or (now - last_entry_scan).total_seconds() >= ENTRY_SCAN_SECONDS
+                )
+                if do_entry_scan:
+                    log.info(f"━━ Entry scan {now.strftime('%Y-%m-%d %H:%M ET')} ━━")
+                    if not self.get_open_option_positions() and self.before_late_cutoff():
+                        df = self.get_bars()
+                        if df is not None:
+                            signal, reason = get_signal(df)
+                            log.info(f"Signal: {signal or 'none'} | {reason}")
+                            if signal == "buy":
+                                self.place_trade("call", reason)
+                            elif signal == "sell":
+                                self.place_trade("put", reason)
+                    last_entry_scan = now
+
+            except Exception as e:
+                # A persistent process must never die from one bad cycle -
+                # log it clearly and keep running, unlike a one-shot script
+                # where a crash just fails that single run.
+                log.error(f"💥 Cycle error (continuing): {e}")
+
+            time.sleep(EXIT_CHECK_SECONDS)
 
 
 if __name__ == "__main__":
-    try:
-        FastballBot().run()
-    except Exception as e:
-        log.error(f"💥 Bot crashed this cycle: {e}")
-        raise
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "loop"
+
+    bot = FastballBot()
+    if mode == "once":
+        # Manual/cron-triggered single run: python fastball_bot.py once
+        bot.run_once()
+    else:
+        # Default: persistent loop for Railway or any always-on host
+        bot.run_forever()
