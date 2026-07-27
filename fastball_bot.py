@@ -144,17 +144,17 @@ def get_signal(df: pd.DataFrame):
     bear_cross = False
     for i in range(1, CROSSOVER_LOOKBACK + 1):
         idx, cur = -(i + 1), -i
-        if len(e12) > abs(idx):
+        if len(e9) > abs(idx):
             if e9.iloc[idx] <= e9.iloc[idx] and e9.iloc[cur] > e21.iloc[cur]:
                 bull_cross = True
             if e9.iloc[idx] >= e21.iloc[idx] and e9.iloc[cur] < e21.iloc[cur]:
                 bear_cross = True
 
     if bull_cross and last_rsi > 50 and vol_ok and macd_turning_up and macd_bullish:
-        return "buy", f"EMA12 x above EMA26 | RSI {last_rsi:.0f} | MACD turning up | vol confirmed"
+        return "buy", f"EMA9 x above EMA21 | RSI {last_rsi:.0f} | MACD turning up | vol confirmed"
 
     if bear_cross and last_rsi < 50 and vol_ok and macd_turning_down and macd_bearish:
-        return "sell", f"EMA12 x below EMA26 | RSI {last_rsi:.0f} | MACD turning down | vol confirmed"
+        return "sell", f"EMA9 x below EMA21 | RSI {last_rsi:.0f} | MACD turning down | vol confirmed"
 
     return None, "no signal"
 
