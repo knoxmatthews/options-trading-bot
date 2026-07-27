@@ -6,7 +6,7 @@ profiting from SPY staying in a range, this bot BUYS calls and puts
 and profits from SPY making a real directional move.
 
 Strategy:
-- Reuses the same proven EMA9/21 + RSI + MACD confluence signal as
+- Reuses the same proven EMA12/26 + RSI + MACD confluence signal as
   Curveball Bot (no reason to invent an unproven new signal for a
   directional bet)
 - BUY signal -> buy a call.  SELL signal -> buy a put.
@@ -56,8 +56,8 @@ PAPER      = True
 UNDERLYING = "SPY"
 
 # Position sizing - risk-based, not flat
-RISK_PCT       = 0.20   # 20% of equity in premium paid per trade
-MAX_CONTRACTS  = 7
+RISK_PCT       = 0.04   # 4% of equity in premium paid per trade
+MAX_CONTRACTS  = 6
 MAX_BUDGET_OVERSHOOT = 1.5  # allow 1 contract even if it's up to 1.5x the target
                              # risk budget, but skip entirely beyond that
 
@@ -73,11 +73,10 @@ STOP_LOSS_PCT         = -0.35  # close at -35% loss on premium paid
 CLOSE_DAYS_BEFORE_DTE = 2      # force close once within 2 days of expiry,
                                 # regardless of P&L - avoids the theta cliff
 
-# Signal settings - identical to Curveball's proven Gainz Style Algo v2
-EMA_FAST   = 9
-EMA_SLOW   = 21
+# Signal settings - 4-voice majority vote system
+EMA_FAST   = 12
+EMA_SLOW   = 26
 RSI_PERIOD = 14
-CROSSOVER_LOOKBACK = 3   # catches crossovers missed between delayed GH Actions runs
 
 ET = ZoneInfo("America/New_York")
 
@@ -99,34 +98,103 @@ def rsi(s: pd.Series, p: int = 14) -> pd.Series:
     l = (-d.clip(upper=0)).rolling(p).mean().replace(0, 0.0001)
     return 100 - 100 / (1 + g / l)
 
-def macd(s: pd.Series, fast: int = 9, slow: int = 21, signal: int = 9):
+def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     macd_line   = ema(s, fast) - ema(s, slow)
     signal_line = ema(macd_line, signal)
     histogram   = macd_line - signal_line
     return macd_line, signal_line, histogram
 
+CONFIRMATION_BARS = 2   # candles that must confirm the vote AFTER it first reaches majority
+LOOKBACK_WINDOW    = 5   # search this many recent bars for a valid confirmed run,
+                          # so a delayed check doesn't miss it
+MIN_VOTES          = 3   # majority out of 4 total voices (EMA, RSI, MACD, S/R)
+
+SR_LOOKBACK       = 60
+SR_EXCLUDE_RECENT = 3
+SR_BUFFER_PCT     = 0.0015
+
+def rsi_vote(rsi_val: float) -> str:
+    """
+    Zone-based, not a single 50-line: RSI > 70 is overbought - stretched,
+    not a fresh confirmation - so it ABSTAINS rather than flipping bearish.
+    This is the exact fix for buying a call at RSI 71: that reading now
+    abstains instead of counting as bullish.
+    """
+    if 50 < rsi_val < 70:
+        return "bull"
+    if 30 < rsi_val < 50:
+        return "bear"
+    return "none"
+
+def get_sr_zones(df: pd.DataFrame):
+    if len(df) < SR_LOOKBACK + SR_EXCLUDE_RECENT:
+        return None, None
+    window = df.iloc[-(SR_LOOKBACK + SR_EXCLUDE_RECENT):-SR_EXCLUDE_RECENT]
+    return window["low"].min(), window["high"].max()
+
+def sr_vote(last_close: float, prior_close: float, support: float, resistance: float) -> str:
+    if support is None or resistance is None:
+        return "none"
+    if last_close > resistance:
+        return "bull"
+    if last_close < support:
+        return "bear"
+    near_support    = last_close <= support * (1 + SR_BUFFER_PCT)
+    near_resistance = last_close >= resistance * (1 - SR_BUFFER_PCT)
+    if near_support and last_close > prior_close:
+        return "bull"
+    if near_resistance and last_close < prior_close:
+        return "bear"
+    return "none"
+
+def get_votes(e12_val, e26_val, rsi_val, macd_line_val, macd_signal_val,
+              last_close, prior_close, support, resistance) -> str:
+    bull_votes = 0
+    bear_votes = 0
+
+    if e12_val > e26_val:   bull_votes += 1
+    elif e12_val < e26_val: bear_votes += 1
+
+    rv = rsi_vote(rsi_val)
+    if rv == "bull": bull_votes += 1
+    elif rv == "bear": bear_votes += 1
+
+    if macd_line_val > macd_signal_val:   bull_votes += 1
+    elif macd_line_val < macd_signal_val: bear_votes += 1
+
+    sv = sr_vote(last_close, prior_close, support, resistance)
+    if sv == "bull": bull_votes += 1
+    elif sv == "bear": bear_votes += 1
+
+    if bull_votes >= MIN_VOTES:
+        return "bull"
+    if bear_votes >= MIN_VOTES:
+        return "bear"
+    return "none"
+
 def get_signal(df: pd.DataFrame):
     """
-    Same confluence as Curveball's Gainz Style Algo v2:
-    - BUY:  EMA9 crosses above EMA21 within last N bars + RSI>50 +
-            volume confirmed + MACD turning up and bullish
-    - SELL: mirror image for bearish
-    No 'force' fallback here - see module docstring for why.
-    Returns (signal, reason)
+    4-voice majority vote (EMA, RSI-zone, MACD, S/R) - needs 3 of 4 to
+    agree, then that majority must hold for CONFIRMATION_BARS additional
+    candles before entering. No 'force' fallback here - see module
+    docstring for why. Returns (signal, reason).
     """
-    if len(df) < EMA_SLOW + CROSSOVER_LOOKBACK + 15:
+    run_length = CONFIRMATION_BARS + 1
+    min_bars   = max(EMA_SLOW, RSI_PERIOD, SR_LOOKBACK + SR_EXCLUDE_RECENT) + LOOKBACK_WINDOW + run_length
+
+    if len(df) < min_bars:
         return None, "not enough bars"
 
     close  = df["close"]
     volume = df["volume"]
 
-    e9    = ema(close, EMA_FAST)
-    e21    = ema(close, EMA_SLOW)
+    e12    = ema(close, EMA_FAST)
+    e26    = ema(close, EMA_SLOW)
     r      = rsi(close, RSI_PERIOD)
     avgvol = volume.rolling(20).mean()
     macd_line, macd_signal, macd_hist = macd(close)
+    support, resistance = get_sr_zones(df)
 
-    last_rsi    = r.iloc[-1]
     last_vol    = volume.iloc[-1]
     last_avgvol = avgvol.iloc[-1]
 
@@ -134,29 +202,32 @@ def get_signal(df: pd.DataFrame):
         return None, "indicator not ready"
 
     vol_ok = last_vol > last_avgvol
+    if not vol_ok:
+        return None, "volume below average - no trade regardless of votes"
 
-    macd_turning_up   = macd_hist.iloc[-1] > macd_hist.iloc[-2]
-    macd_turning_down = macd_hist.iloc[-1] < macd_hist.iloc[-2]
-    macd_bullish      = macd_line.iloc[-1] > macd_signal.iloc[-1]
-    macd_bearish      = macd_line.iloc[-1] < macd_signal.iloc[-1]
+    votes_series = []
+    for i in range(LOOKBACK_WINDOW + run_length, 0, -1):
+        idx = -i
+        if abs(idx) > len(e12) or abs(idx) < 4:
+            continue
+        votes_series.append(get_votes(
+            e12.iloc[idx], e26.iloc[idx], r.iloc[idx],
+            macd_line.iloc[idx], macd_signal.iloc[idx],
+            close.iloc[idx], close.iloc[idx - 3],
+            support, resistance,
+        ))
 
-    bull_cross = False
-    bear_cross = False
-    for i in range(1, CROSSOVER_LOOKBACK + 1):
-        idx, cur = -(i + 1), -i
-        if len(e9) > abs(idx):
-            if e9.iloc[idx] <= e9.iloc[idx] and e9.iloc[cur] > e21.iloc[cur]:
-                bull_cross = True
-            if e9.iloc[idx] >= e21.iloc[idx] and e9.iloc[cur] < e21.iloc[cur]:
-                bear_cross = True
+    n = len(votes_series)
+    for end in range(n - 1, max(n - 1 - LOOKBACK_WINDOW, run_length - 2), -1):
+        window = votes_series[end - run_length + 1: end + 1]
+        if len(window) != run_length:
+            continue
+        if all(v == "bull" for v in window):
+            return "buy", f"Majority bull vote confirmed {run_length} candles"
+        if all(v == "bear" for v in window):
+            return "sell", f"Majority bear vote confirmed {run_length} candles"
 
-    if bull_cross and last_rsi > 50 and vol_ok and macd_turning_up and macd_bullish:
-        return "buy", f"EMA9 x above EMA21 | RSI {last_rsi:.0f} | MACD turning up | vol confirmed"
-
-    if bear_cross and last_rsi < 50 and vol_ok and macd_turning_down and macd_bearish:
-        return "sell", f"EMA9 x below EMA21 | RSI {last_rsi:.0f} | MACD turning down | vol confirmed"
-
-    return None, "no signal"
+    return None, "no confirmed vote"
 
 # ── BOT ──────────────────────────────────────────────────────────────────────
 
