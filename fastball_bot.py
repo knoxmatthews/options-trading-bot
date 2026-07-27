@@ -6,7 +6,7 @@ profiting from SPY staying in a range, this bot BUYS calls and puts
 and profits from SPY making a real directional move.
 
 Strategy:
-- Reuses the same proven EMA12/26 + RSI + MACD confluence signal as
+- Reuses the same proven EMA9/21 + RSI + MACD confluence signal as
   Curveball Bot (no reason to invent an unproven new signal for a
   directional bet)
 - BUY signal -> buy a call.  SELL signal -> buy a put.
@@ -56,7 +56,7 @@ PAPER      = True
 UNDERLYING = "SPY"
 
 # Position sizing - risk-based, not flat
-RISK_PCT       = 0.04   # 4% of equity in premium paid per trade
+RISK_PCT       = 0.10   # 10% of equity in premium paid per trade
 MAX_CONTRACTS  = 6
 MAX_BUDGET_OVERSHOOT = 1.5  # allow 1 contract even if it's up to 1.5x the target
                              # risk budget, but skip entirely beyond that
@@ -74,8 +74,8 @@ CLOSE_DAYS_BEFORE_DTE = 2      # force close once within 2 days of expiry,
                                 # regardless of P&L - avoids the theta cliff
 
 # Signal settings - identical to Curveball's proven Gainz Style Algo v2
-EMA_FAST   = 12
-EMA_SLOW   = 26
+EMA_FAST   = 9
+EMA_SLOW   = 21
 RSI_PERIOD = 14
 CROSSOVER_LOOKBACK = 3   # catches crossovers missed between delayed GH Actions runs
 
@@ -99,7 +99,7 @@ def rsi(s: pd.Series, p: int = 14) -> pd.Series:
     l = (-d.clip(upper=0)).rolling(p).mean().replace(0, 0.0001)
     return 100 - 100 / (1 + g / l)
 
-def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+def macd(s: pd.Series, fast: int = 9, slow: int = 21, signal: int = 9):
     macd_line   = ema(s, fast) - ema(s, slow)
     signal_line = ema(macd_line, signal)
     histogram   = macd_line - signal_line
@@ -108,7 +108,7 @@ def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
 def get_signal(df: pd.DataFrame):
     """
     Same confluence as Curveball's Gainz Style Algo v2:
-    - BUY:  EMA12 crosses above EMA26 within last N bars + RSI>50 +
+    - BUY:  EMA9 crosses above EMA21 within last N bars + RSI>50 +
             volume confirmed + MACD turning up and bullish
     - SELL: mirror image for bearish
     No 'force' fallback here - see module docstring for why.
@@ -145,9 +145,9 @@ def get_signal(df: pd.DataFrame):
     for i in range(1, CROSSOVER_LOOKBACK + 1):
         idx, cur = -(i + 1), -i
         if len(e12) > abs(idx):
-            if e12.iloc[idx] <= e26.iloc[idx] and e12.iloc[cur] > e26.iloc[cur]:
+            if e9.iloc[idx] <= e9.iloc[idx] and e9.iloc[cur] > e21.iloc[cur]:
                 bull_cross = True
-            if e12.iloc[idx] >= e26.iloc[idx] and e12.iloc[cur] < e26.iloc[cur]:
+            if e9.iloc[idx] >= e21.iloc[idx] and e9.iloc[cur] < e21.iloc[cur]:
                 bear_cross = True
 
     if bull_cross and last_rsi > 50 and vol_ok and macd_turning_up and macd_bullish:
