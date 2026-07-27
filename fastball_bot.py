@@ -56,8 +56,8 @@ PAPER      = True
 UNDERLYING = "SPY"
 
 # Position sizing - risk-based, not flat
-RISK_PCT       = 0.10   # 10% of equity in premium paid per trade
-MAX_CONTRACTS  = 6
+RISK_PCT       = 0.20   # 20% of equity in premium paid per trade
+MAX_CONTRACTS  = 7
 MAX_BUDGET_OVERSHOOT = 1.5  # allow 1 contract even if it's up to 1.5x the target
                              # risk budget, but skip entirely beyond that
 
