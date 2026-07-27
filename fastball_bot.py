@@ -120,8 +120,8 @@ def get_signal(df: pd.DataFrame):
     close  = df["close"]
     volume = df["volume"]
 
-    e12    = ema(close, EMA_FAST)
-    e26    = ema(close, EMA_SLOW)
+    e9    = ema(close, EMA_FAST)
+    e21    = ema(close, EMA_SLOW)
     r      = rsi(close, RSI_PERIOD)
     avgvol = volume.rolling(20).mean()
     macd_line, macd_signal, macd_hist = macd(close)
