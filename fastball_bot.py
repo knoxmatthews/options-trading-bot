@@ -1,554 +1,300 @@
 """
-Fastball Bot - Directional Options Buyer (Calls & Puts)
----------------------------------------------------------
-The opposite of Iron Condor Bot: instead of SELLING premium and
-profiting from SPY staying in a range, this bot BUYS calls and puts
-and profits from SPY making a real directional move.
+SuperTrend-at-Open options signal bot.
 
-Strategy:
-- Reuses the same proven EMA12/26 + RSI + MACD confluence signal as
-  Curveball Bot (no reason to invent an unproven new signal for a
-  directional bet)
-- BUY signal -> buy a call.  SELL signal -> buy a put.
-- Targets options 3-10 days to expiration (0DTE decays too fast for
-  BUYING - that's why Iron Condor sells 0DTE instead of buying it)
-- ATM strike (closest to current price) - best balance of cost vs
-  sensitivity to the move
-- One position at a time - no stacking calls and puts
-- Risk-based contract sizing - position size comes from real premium
-  quotes, not a flat guess
-- NO forced trades - unlike Curveball, a bad forced entry here decays
-  toward zero every day it's wrong, so this bot only fires on real
-  signal confluence
+At market open, checks SuperTrend(factor=1.75, ATR=10) on the underlying.
+Uptrend -> buys the at-the-money call. Downtrend -> buys the at-the-money put.
+Position is closed either when the underlying's SuperTrend flips against it,
+or at end of day (0DTE-style, matching the existing iron-condor-bot's
+same-day-expiration convention) — whichever comes first.
 
-IMPORTANT: This bot assumes it has its OWN DEDICATED Alpaca account,
-separate from Curveball and Iron Condor. It treats every open option
-position in the account as its own - if you ever point this at an
-account another bot also trades, the position-tracking logic below
-will get confused.
+Runs as a persistent worker (Railway), not a cron job — GitHub Actions cron
+wasn't reliable to the minute for curveball-bot, and catching the exact open
+matters more here than for a 5-minute EMA check.
 
-GitHub Actions secrets needed: FASTBALL_API_KEY, FASTBALL_API_SECRET
+Env vars (names match ALPACA_API_KEY / ALPACA_API_SECRET already used by
+curveball-bot and iron-condor-bot):
+    ALPACA_API_KEY          required
+    ALPACA_API_SECRET       required
+    ALPACA_PAPER            "true"/"false", default "true"
+    UNDERLYING_SYMBOL       default "SPY"
+    ST_ATR_PERIOD           default "10"
+    ST_MULTIPLIER           default "1.75"
+    BAR_TIMEFRAME_MINUTES   default "5"
+    MAX_PREMIUM_USD         default "500"   (dollar budget for premium per trade)
+    ENTRY_WINDOW_START      default "09:30"
+    ENTRY_WINDOW_END        default "09:35" (grace window for loop timing)
+    EOD_CLOSE_TIME          default "15:45"
+    POLL_SECONDS            default "20"
+
+KNOWN LIMITATIONS (first version — expect to iterate, same as the other bots):
+  - "Already traded today" is tracked in memory. A Railway restart mid-day
+    could reset it; the bot still won't double-enter because it also checks
+    for an existing open position first, but it could skip a day's trade if
+    it restarts after already closing a position. Worth hardening with real
+    persistence (a small database or Railway volume) once this is running.
+  - ATM strike search widens to a nearby expiration if 0DTE isn't listed for
+    a given day; double check this fallback is actually what you want.
+  - Order fills, not just submissions, aren't explicitly confirmed before
+    logging success — reasonable for paper trading, worth adding a fill
+    check before this touches real money.
 """
 
 import os
 import time
 import logging
-import datetime
-from datetime import timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 
-import numpy as np
 import pandas as pd
+import pytz
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, ContractType, AssetClass, AssetStatus
+from alpaca.trading.requests import GetOptionContractsRequest, MarketOrderRequest
+from alpaca.trading.enums import ContractType, AssetStatus, OrderSide, OrderType, TimeInForce
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, OptionLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed, OptionsFeed
 
-# ── CONFIG ───────────────────────────────────────────────────────────────────
-API_KEY    = os.environ.get("FASTBALL_API_KEY", "")
-API_SECRET = os.environ.get("FASTBALL_API_SECRET", "")
-PAPER      = True
+from supertrend import compute_supertrend
 
-UNDERLYING = "SPY"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("supertrend_options_bot")
 
-# Position sizing - risk-based, not flat
-RISK_PCT       = 0.04   # 4% of equity in premium paid per trade
-MAX_CONTRACTS  = 6
-MAX_BUDGET_OVERSHOOT = 1.5  # allow 1 contract even if it's up to 1.5x the target
-                             # risk budget, but skip entirely beyond that
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+API_KEY = os.environ["ALPACA_API_KEY"]
+API_SECRET = os.environ["ALPACA_API_SECRET"]
+PAPER = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
 
-# Expiration & strike selection
-MIN_DTE          = 3    # avoid 0-2 DTE - decay too fast for BUYING options
-MAX_DTE          = 10   # keep it to roughly a weekly - don't pay for a month
-                         # of unused time value
-STRIKE_RANGE_PCT = 0.02 # look within 2% of current price to find the ATM strike
+UNDERLYING_SYMBOL = os.environ.get("UNDERLYING_SYMBOL", "SPY")
+ST_ATR_PERIOD = int(os.environ.get("ST_ATR_PERIOD", "10"))
+ST_MULTIPLIER = float(os.environ.get("ST_MULTIPLIER", "1.75"))
+BAR_TIMEFRAME_MINUTES = int(os.environ.get("BAR_TIMEFRAME_MINUTES", "5"))
+MAX_PREMIUM_USD = float(os.environ.get("MAX_PREMIUM_USD", "500"))
+ENTRY_WINDOW_START = os.environ.get("ENTRY_WINDOW_START", "09:30")
+ENTRY_WINDOW_END = os.environ.get("ENTRY_WINDOW_END", "09:35")
+EOD_CLOSE_TIME = os.environ.get("EOD_CLOSE_TIME", "15:45")
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "20"))
 
-# Exit rules
-TAKE_PROFIT_PCT       = 0.50   # close at +50% gain on premium paid
-STOP_LOSS_PCT         = -0.35  # close at -35% loss on premium paid
-CLOSE_DAYS_BEFORE_DTE = 2      # force close once within 2 days of expiry,
-                                # regardless of P&L - avoids the theta cliff
+ET = pytz.timezone("America/New_York")
 
-# Signal settings - 4-voice majority vote system
-EMA_FAST   = 12
-EMA_SLOW   = 26
-RSI_PERIOD = 14
+trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER)
+stock_data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
 
-ET = ZoneInfo("America/New_York")
+# In-memory state — Alpaca's own positions are the source of truth on every
+# loop; this just tracks what we don't want to re-derive every cycle.
+state = {"traded_today": None, "position_side": None}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-log = logging.getLogger("fastball")
 
-# ── INDICATORS - same proven logic as Curveball ─────────────────────────────
+def parse_hhmm(s: str):
+    h, m = s.split(":")
+    return int(h), int(m)
 
-def ema(s: pd.Series, p: int) -> pd.Series:
-    return s.ewm(span=p, adjust=False).mean()
 
-def rsi(s: pd.Series, p: int = 14) -> pd.Series:
-    d = s.diff()
-    g = d.clip(lower=0).rolling(p).mean()
-    l = (-d.clip(upper=0)).rolling(p).mean().replace(0, 0.0001)
-    return 100 - 100 / (1 + g / l)
+def now_et() -> datetime:
+    return datetime.now(ET)
 
-def macd(s: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line   = ema(s, fast) - ema(s, slow)
-    signal_line = ema(macd_line, signal)
-    histogram   = macd_line - signal_line
-    return macd_line, signal_line, histogram
 
-CONFIRMATION_BARS = 2   # candles that must confirm the vote AFTER it first reaches majority
-LOOKBACK_WINDOW    = 5   # search this many recent bars for a valid confirmed run,
-                          # so a delayed check doesn't miss it
-MIN_VOTES          = 3   # majority out of 4 total voices (EMA, RSI, MACD, S/R)
+def in_entry_window(now: datetime) -> bool:
+    sh, sm = parse_hhmm(ENTRY_WINDOW_START)
+    eh, em = parse_hhmm(ENTRY_WINDOW_END)
+    start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+    end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return start <= now <= end
 
-SR_LOOKBACK       = 60
-SR_EXCLUDE_RECENT = 3
-SR_BUFFER_PCT     = 0.0015
 
-def rsi_vote(rsi_val: float) -> str:
-    """
-    Zone-based, not a single 50-line: RSI > 70 is overbought - stretched,
-    not a fresh confirmation - so it ABSTAINS rather than flipping bearish.
-    This is the exact fix for buying a call at RSI 71: that reading now
-    abstains instead of counting as bullish.
-    """
-    if 50 < rsi_val < 70:
-        return "bull"
-    if 30 < rsi_val < 50:
-        return "bear"
-    return "none"
+def past_eod_close(now: datetime) -> bool:
+    eh, em = parse_hhmm(EOD_CLOSE_TIME)
+    eod = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+    return now >= eod
 
-def get_sr_zones(df: pd.DataFrame):
-    if len(df) < SR_LOOKBACK + SR_EXCLUDE_RECENT:
-        return None, None
-    window = df.iloc[-(SR_LOOKBACK + SR_EXCLUDE_RECENT):-SR_EXCLUDE_RECENT]
-    return window["low"].min(), window["high"].max()
 
-def sr_vote(last_close: float, prior_close: float, support: float, resistance: float) -> str:
-    if support is None or resistance is None:
-        return "none"
-    if last_close > resistance:
-        return "bull"
-    if last_close < support:
-        return "bear"
-    near_support    = last_close <= support * (1 + SR_BUFFER_PCT)
-    near_resistance = last_close >= resistance * (1 - SR_BUFFER_PCT)
-    if near_support and last_close > prior_close:
-        return "bull"
-    if near_resistance and last_close < prior_close:
-        return "bear"
-    return "none"
+def _bars_df(symbol: str, timeframe: TimeFrame, start=None, limit=None) -> pd.DataFrame:
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=timeframe, start=start, limit=limit)
+    bars = stock_data_client.get_stock_bars(req).df
+    if bars.empty:
+        raise RuntimeError(f"No bars returned for {symbol}")
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level="symbol")
+    return bars.sort_index()
 
-def get_votes(e12_val, e26_val, rsi_val, macd_line_val, macd_signal_val,
-              last_close, prior_close, support, resistance) -> str:
-    bull_votes = 0
-    bear_votes = 0
 
-    if e12_val > e26_val:   bull_votes += 1
-    elif e12_val < e26_val: bear_votes += 1
+def get_latest_uptrend_signal() -> bool:
+    tf = TimeFrame(BAR_TIMEFRAME_MINUTES, TimeFrameUnit.Minute)
+    bars = _bars_df(UNDERLYING_SYMBOL, tf, start=now_et() - timedelta(days=5))
+    result = compute_supertrend(bars, atr_period=ST_ATR_PERIOD, multiplier=ST_MULTIPLIER)
+    return bool(result["is_uptrend"].iloc[-1])
 
-    rv = rsi_vote(rsi_val)
-    if rv == "bull": bull_votes += 1
-    elif rv == "bear": bear_votes += 1
 
-    if macd_line_val > macd_signal_val:   bull_votes += 1
-    elif macd_line_val < macd_signal_val: bear_votes += 1
+def get_underlying_price() -> float:
+    bars = _bars_df(UNDERLYING_SYMBOL, TimeFrame(1, TimeFrameUnit.Minute), limit=1)
+    return float(bars["close"].iloc[-1])
 
-    sv = sr_vote(last_close, prior_close, support, resistance)
-    if sv == "bull": bull_votes += 1
-    elif sv == "bear": bear_votes += 1
 
-    if bull_votes >= MIN_VOTES:
-        return "bull"
-    if bear_votes >= MIN_VOTES:
-        return "bear"
-    return "none"
+def find_atm_contract(option_type: ContractType):
+    underlying_price = get_underlying_price()
+    today = now_et().date()
+    strike_lo = str(round(underlying_price * 0.90, 2))
+    strike_hi = str(round(underlying_price * 1.10, 2))
 
-def get_signal(df: pd.DataFrame):
-    """
-    4-voice majority vote (EMA, RSI-zone, MACD, S/R) - needs 3 of 4 to
-    agree, then that majority must hold for CONFIRMATION_BARS additional
-    candles before entering. No 'force' fallback here - see module
-    docstring for why. Returns (signal, reason).
-    """
-    run_length = CONFIRMATION_BARS + 1
-    min_bars   = max(EMA_SLOW, RSI_PERIOD, SR_LOOKBACK + SR_EXCLUDE_RECENT) + LOOKBACK_WINDOW + run_length
+    req = GetOptionContractsRequest(
+        underlying_symbols=[UNDERLYING_SYMBOL],
+        status=AssetStatus.ACTIVE,
+        type=option_type,
+        strike_price_gte=strike_lo,
+        strike_price_lte=strike_hi,
+        expiration_date=today,
+    )
+    contracts = trading_client.get_option_contracts(req).option_contracts
 
-    if len(df) < min_bars:
-        return None, "not enough bars"
-
-    close  = df["close"]
-    volume = df["volume"]
-
-    e12    = ema(close, EMA_FAST)
-    e26    = ema(close, EMA_SLOW)
-    r      = rsi(close, RSI_PERIOD)
-    avgvol = volume.rolling(20).mean()
-    macd_line, macd_signal, macd_hist = macd(close)
-    support, resistance = get_sr_zones(df)
-
-    last_vol    = volume.iloc[-1]
-    last_avgvol = avgvol.iloc[-1]
-
-    if pd.isna(last_avgvol) or pd.isna(macd_hist.iloc[-1]):
-        return None, "indicator not ready"
-
-    vol_ok = last_vol > last_avgvol
-    if not vol_ok:
-        return None, "volume below average - no trade regardless of votes"
-
-    votes_series = []
-    for i in range(LOOKBACK_WINDOW + run_length, 0, -1):
-        idx = -i
-        if abs(idx) > len(e12) or abs(idx) < 4:
-            continue
-        votes_series.append(get_votes(
-            e12.iloc[idx], e26.iloc[idx], r.iloc[idx],
-            macd_line.iloc[idx], macd_signal.iloc[idx],
-            close.iloc[idx], close.iloc[idx - 3],
-            support, resistance,
-        ))
-
-    n = len(votes_series)
-    for end in range(n - 1, max(n - 1 - LOOKBACK_WINDOW, run_length - 2), -1):
-        window = votes_series[end - run_length + 1: end + 1]
-        if len(window) != run_length:
-            continue
-        if all(v == "bull" for v in window):
-            return "buy", f"Majority bull vote confirmed {run_length} candles"
-        if all(v == "bear" for v in window):
-            return "sell", f"Majority bear vote confirmed {run_length} candles"
-
-    return None, "no confirmed vote"
-
-# ── BOT ──────────────────────────────────────────────────────────────────────
-
-class FastballBot:
-    def __init__(self):
-        if not API_KEY or not API_SECRET:
-            raise RuntimeError("Missing FASTBALL_API_KEY or FASTBALL_API_SECRET")
-        self.trade  = TradingClient(API_KEY, API_SECRET, paper=PAPER)
-        self.sdata  = StockHistoricalDataClient(API_KEY, API_SECRET)
-        self.odata  = OptionHistoricalDataClient(API_KEY, API_SECRET)
-        if not PAPER:
-            raise RuntimeError("PAPER=False. Refusing to run against a live account.")
-        acct = self.trade.get_account()
-        log.info(f"Connected | Equity=${acct.equity} | BP=${acct.buying_power} | Positions={len(self.trade.get_all_positions())}")
-
-    # ── market timing ────────────────────────────────────────────────────────
-
-    def is_market_open(self) -> bool:
-        n = datetime.datetime.now(ET)
-        if n.weekday() >= 5:
-            return False
-        o = n.replace(hour=9,  minute=30, second=0, microsecond=0)
-        c = n.replace(hour=16, minute=0,  second=0, microsecond=0)
-        return o <= n <= c
-
-    def past_open_buffer(self, minutes: int = 5) -> bool:
-        n = datetime.datetime.now(ET)
-        buffer_end = n.replace(hour=9, minute=30, second=0, microsecond=0) + timedelta(minutes=minutes)
-        return n >= buffer_end
-
-    def before_late_cutoff(self) -> bool:
-        """No new entries in the last 15 min - fills get worse, no benefit to entering that late."""
-        n = datetime.datetime.now(ET)
-        cutoff = n.replace(hour=15, minute=45, second=0, microsecond=0)
-        return n < cutoff
-
-    # ── data ─────────────────────────────────────────────────────────────────
-
-    def get_bars(self) -> pd.DataFrame | None:
-        end   = datetime.datetime.now(timezone.utc)
-        start = end - timedelta(days=4)
-        try:
-            req  = StockBarsRequest(
-                symbol_or_symbols = UNDERLYING,
-                timeframe         = TimeFrame(5, TimeFrameUnit.Minute),
-                start             = start,
-                end               = end,
-                feed              = DataFeed.IEX,  # free accounts can't query SIP
-            )
-            bars = self.sdata.get_stock_bars(req).df
-            return bars.reset_index() if not bars.empty else None
-        except Exception as e:
-            log.error(f"Bar fetch failed: {e}")
-            return None
-
-    def get_spy_price(self) -> float | None:
-        df = self.get_bars()
-        if df is None or df.empty:
-            return None
-        return float(df["close"].iloc[-1])
-
-    def get_option_quote(self, symbol: str) -> float | None:
-        """
-        Real bid/ask mid price for one option contract.
-        Returns None on failure - for BUYING, a failed quote must SKIP the
-        trade, never guess. Guessing cheap would oversize the position;
-        guessing expensive would just be made up. Skipping is the only safe
-        default when we can't see the real price.
-        """
-        try:
-            req   = OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=OptionsFeed.INDICATIVE)
-            quote = self.odata.get_option_latest_quote(req)[symbol]
-            bid, ask = float(quote.bid_price), float(quote.ask_price)
-            if bid <= 0 or ask <= 0:
-                return None
-            return (bid + ask) / 2
-        except Exception as e:
-            log.warning(f"Could not get quote for {symbol}: {e}")
-            return None
-
-    def find_contract(self, side: str):
-        """
-        side: 'call' or 'put'
-        Finds the ATM contract within MIN_DTE-MAX_DTE days out.
-        Returns the option contract object or None.
-        """
-        price = self.get_spy_price()
-        if price is None:
-            log.warning("Could not get SPY price.")
-            return None
-
-        today = datetime.date.today()
-        min_exp = today + timedelta(days=MIN_DTE)
-        max_exp = today + timedelta(days=MAX_DTE)
-
-        try:
-            req = GetOptionContractsRequest(
-                underlying_symbols = [UNDERLYING],
-                status             = AssetStatus.ACTIVE,
-                type               = ContractType.CALL if side == "call" else ContractType.PUT,
-                strike_price_gte   = str(round(price * (1 - STRIKE_RANGE_PCT), 2)),
-                strike_price_lte   = str(round(price * (1 + STRIKE_RANGE_PCT), 2)),
-                expiration_date_gte = min_exp,
-                expiration_date_lte = max_exp,
-            )
-            contracts = self.trade.get_option_contracts(req).option_contracts
-        except Exception as e:
-            log.error(f"Contract fetch failed: {e}")
-            return None
-
+    if not contracts:
+        log.info("No 0DTE contracts found for %s, widening to nearest expiration in the next 7 days", UNDERLYING_SYMBOL)
+        req2 = GetOptionContractsRequest(
+            underlying_symbols=[UNDERLYING_SYMBOL],
+            status=AssetStatus.ACTIVE,
+            type=option_type,
+            strike_price_gte=strike_lo,
+            strike_price_lte=strike_hi,
+            expiration_date_gte=today,
+            expiration_date_lte=today + timedelta(days=7),
+        )
+        contracts = trading_client.get_option_contracts(req2).option_contracts
         if not contracts:
-            log.warning(f"No {side} contracts found in DTE/strike window.")
-            return None
+            raise RuntimeError(f"No {option_type.value} contracts found for {UNDERLYING_SYMBOL}")
+        min_exp = min(c.expiration_date for c in contracts)
+        contracts = [c for c in contracts if c.expiration_date == min_exp]
 
-        # Pick the nearest expiration in the window (cheapest time value while
-        # still respecting MIN_DTE), then the strike closest to current price
-        contracts.sort(key=lambda c: c.expiration_date)
-        nearest_exp = contracts[0].expiration_date
-        same_exp    = [c for c in contracts if c.expiration_date == nearest_exp]
-        best        = min(same_exp, key=lambda c: abs(float(c.strike_price) - price))
+    return min(contracts, key=lambda c: abs(c.strike_price - underlying_price))
 
-        dte = (best.expiration_date - today).days
-        log.info(f"Selected {side.upper()} {best.symbol} | strike {best.strike_price} | {dte} DTE")
-        return best
 
-    # ── positions ────────────────────────────────────────────────────────────
+def size_contract_qty(symbol: str) -> int:
+    req = OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+    quote = option_data_client.get_option_latest_quote(req)[symbol]
+    ask = float(quote.ask_price)
+    if ask <= 0:
+        raise RuntimeError(f"No valid ask price for {symbol}")
+    return max(int(MAX_PREMIUM_USD // (ask * 100)), 1)
 
-    def get_open_option_positions(self) -> list:
-        return [p for p in self.trade.get_all_positions() if p.asset_class == AssetClass.US_OPTION]
 
-    def calc_contracts(self, premium_mid: float, equity: float) -> int:
-        risk_dollars  = equity * RISK_PCT
-        per_contract  = premium_mid * 100
-        if per_contract <= 0:
-            return 0
-        contracts = int(risk_dollars / per_contract)
-        if contracts < 1:
-            # Allow exactly 1 contract if it's not drastically over budget,
-            # otherwise skip the trade entirely rather than force an
-            # oversized entry.
-            if per_contract <= risk_dollars * MAX_BUDGET_OVERSHOOT:
-                contracts = 1
-            else:
-                return 0
-        return min(contracts, MAX_CONTRACTS)
+def submit_buy(symbol: str, qty: int):
+    order = MarketOrderRequest(
+        symbol=symbol, qty=qty, side=OrderSide.BUY,
+        type=OrderType.MARKET, time_in_force=TimeInForce.DAY,
+    )
+    return trading_client.submit_order(order_data=order)
 
-    def place_trade(self, side: str, reason: str):
-        contract = self.find_contract(side)
-        if not contract:
-            return
 
-        premium = self.get_option_quote(contract.symbol)
-        if premium is None:
-            log.warning(f"Skipping trade — could not get a real quote for {contract.symbol}")
-            return
+def get_open_option_position():
+    for p in trading_client.get_all_positions():
+        if p.asset_class.value == "us_option" and UNDERLYING_SYMBOL in p.symbol:
+            return p
+    return None
 
-        acct   = self.trade.get_account()
-        equity = float(acct.equity)
-        qty    = self.calc_contracts(premium, equity)
 
-        if qty < 1:
-            log.info(f"Skipping — premium ${premium*100:.0f}/contract too expensive for risk budget")
-            return
+def wait_until_flat(timeout_s: int = 30) -> bool:
+    """curveball-bot hit a real race condition closing and reopening too
+    fast once — confirm flat before doing anything else with this symbol."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if get_open_option_position() is None:
+            return True
+        time.sleep(2)
+    log.warning("Timed out waiting for position to confirm flat")
+    return False
 
-        cost = premium * 100 * qty
+
+def try_enter():
+    today = now_et().date()
+    if state["traded_today"] == today or get_open_option_position() is not None:
+        return
+
+    try:
+        is_uptrend = get_latest_uptrend_signal()
+    except Exception:
+        log.exception("Failed to compute SuperTrend signal")
+        return
+
+    option_type = ContractType.CALL if is_uptrend else ContractType.PUT
+    side_label = "call" if is_uptrend else "put"
+    log.info("SuperTrend at open: %s -> buying ATM %s", "uptrend" if is_uptrend else "downtrend", side_label)
+
+    try:
+        contract = find_atm_contract(option_type)
+        qty = size_contract_qty(contract.symbol)
+        order = submit_buy(contract.symbol, qty)
+        log.info("Submitted BUY %s x%s (order id=%s)", contract.symbol, qty, order.id)
+        state["position_side"] = side_label
+    except Exception:
+        log.exception("Entry failed")
+        return
+    finally:
+        state["traded_today"] = today
+
+
+def try_exit():
+    pos = get_open_option_position()
+    if pos is None:
+        state["position_side"] = None
+        return
+
+    if state["position_side"] is None:
+        # Resumed after a restart — ask Alpaca what this contract actually is
+        # instead of guessing from the symbol string.
+        contract = trading_client.get_option_contract(pos.symbol)
+        state["position_side"] = contract.type.value
+
+    now = now_et()
+    should_exit, reason = False, ""
+
+    if past_eod_close(now):
+        should_exit, reason = True, "EOD close"
+    else:
         try:
-            order = self.trade.submit_order(MarketOrderRequest(
-                symbol        = contract.symbol,
-                qty           = qty,
-                side          = OrderSide.BUY,
-                time_in_force = TimeInForce.DAY,
-            ))
-            log.info(
-                f"✅ BUY {qty}x {contract.symbol} ({side.upper()}) | "
-                f"~${cost:.0f} total premium | {reason} | id={order.id}"
-            )
-        except Exception as e:
-            log.error(f"❌ Order failed: {e}")
-
-    def monitor_exit(self):
-        """Check the open position (if any) against TP, SL, and DTE cutoff."""
-        positions = self.get_open_option_positions()
-        if not positions:
+            is_uptrend = get_latest_uptrend_signal()
+            if state["position_side"] == "call" and not is_uptrend:
+                should_exit, reason = True, "trend flipped to downtrend"
+            elif state["position_side"] == "put" and is_uptrend:
+                should_exit, reason = True, "trend flipped to uptrend"
+        except Exception:
+            log.exception("Failed to check SuperTrend for exit — leaving position open this cycle")
             return
 
-        for pos in positions:
-            pct = float(pos.unrealized_plpc) * 100
+    if should_exit:
+        log.info("Closing %s x%s — reason: %s", pos.symbol, pos.qty, reason)
+        try:
+            trading_client.close_position(pos.symbol)
+            wait_until_flat()
+        except Exception:
+            log.exception("Exit order failed")
+        finally:
+            state["position_side"] = None
 
-            # Check days to expiration via the contract's own record - safer
-            # than parsing the OCC symbol string ourselves.
-            dte = None
-            try:
-                contract = self.trade.get_option_contract(pos.symbol)
-                dte = (contract.expiration_date - datetime.date.today()).days
-            except Exception as e:
-                log.warning(f"Could not check expiration for {pos.symbol}: {e}")
 
-            should_close = False
-            reason       = ""
+def main():
+    log.info(
+        "Starting SuperTrend-at-open bot | underlying=%s factor=%s atr=%s paper=%s",
+        UNDERLYING_SYMBOL, ST_MULTIPLIER, ST_ATR_PERIOD, PAPER,
+    )
+    while True:
+        try:
+            clock = trading_client.get_clock()
+            if not clock.is_open:
+                time.sleep(POLL_SECONDS)
+                continue
 
-            if pct >= TAKE_PROFIT_PCT * 100:
-                should_close = True
-                reason = f"take profit +{pct:.0f}%"
-            elif pct <= STOP_LOSS_PCT * 100:
-                should_close = True
-                reason = f"stop loss {pct:.0f}%"
-            elif dte is not None and dte <= CLOSE_DAYS_BEFORE_DTE:
-                should_close = True
-                reason = f"{dte} DTE remaining - avoiding theta cliff"
+            now = now_et()
+            if get_open_option_position() is not None:
+                try_exit()
+            elif in_entry_window(now):
+                try_enter()
 
-            if should_close:
-                try:
-                    self.trade.close_position(pos.symbol)
-                    log.info(f"🔒 CLOSED {pos.symbol} | {reason} | P&L {pct:.1f}%")
-                except Exception as e:
-                    log.error(f"Close failed {pos.symbol}: {e}")
+        except Exception:
+            log.exception("Unhandled error in main loop — continuing")
 
-    # ── main ─────────────────────────────────────────────────────────────────
-
-    def scan_cycle(self):
-        """One full cycle: check exits, then look for a new entry if flat."""
-        now = datetime.datetime.now(ET)
-
-        if not self.is_market_open():
-            return "closed"
-
-        if not self.past_open_buffer():
-            return "open_buffer"
-
-        # Always check exits first, regardless of anything else
-        self.monitor_exit()
-
-        # One position at a time - if already holding, don't open another
-        if self.get_open_option_positions():
-            return "holding"
-
-        if not self.before_late_cutoff():
-            return "late_cutoff"
-
-        df = self.get_bars()
-        if df is None:
-            return "no_data"
-
-        signal, reason = get_signal(df)
-        log.info(f"Signal: {signal or 'none'} | {reason}")
-
-        if signal == "buy":
-            self.place_trade("call", reason)
-        elif signal == "sell":
-            self.place_trade("put", reason)
-
-        return "scanned"
-
-    def run_once(self):
-        """Single cycle then exit - used for manual/cron-triggered runs."""
-        now = datetime.datetime.now(ET)
-        log.info(f"━━ Scan {now.strftime('%Y-%m-%d %H:%M ET')} ━━")
-        status = self.scan_cycle()
-        log.info(f"Cycle result: {status}")
-
-    def run_forever(self):
-        """
-        Persistent loop for Railway (or any always-on host).
-        Exits are checked every EXIT_CHECK_SECONDS - much faster reaction
-        than a cron-triggered bot can offer, since a bad move against an
-        open position doesn't have to wait for the next scheduled trigger.
-        New-entry signal scanning runs on a slower cadence since it's tied
-        to 5-min bar data that doesn't change meaningfully faster than that.
-        """
-        EXIT_CHECK_SECONDS  = 30    # fast - protects an open position
-        ENTRY_SCAN_SECONDS  = 300   # 5 min - matches the bar timeframe
-
-        log.info(f"Fastball Bot starting persistent loop | exit checks every {EXIT_CHECK_SECONDS}s, entry scans every {ENTRY_SCAN_SECONDS}s")
-        last_entry_scan = None
-
-        while True:
-            try:
-                now = datetime.datetime.now(ET)
-
-                if not self.is_market_open():
-                    log.info("Market closed — sleeping 60s.")
-                    time.sleep(60)
-                    continue
-
-                if self.past_open_buffer():
-                    self.monitor_exit()
-
-                do_entry_scan = (
-                    last_entry_scan is None
-                    or (now - last_entry_scan).total_seconds() >= ENTRY_SCAN_SECONDS
-                )
-                if do_entry_scan:
-                    log.info(f"━━ Entry scan {now.strftime('%Y-%m-%d %H:%M ET')} ━━")
-                    if not self.get_open_option_positions() and self.before_late_cutoff():
-                        df = self.get_bars()
-                        if df is not None:
-                            signal, reason = get_signal(df)
-                            log.info(f"Signal: {signal or 'none'} | {reason}")
-                            if signal == "buy":
-                                self.place_trade("call", reason)
-                            elif signal == "sell":
-                                self.place_trade("put", reason)
-                    last_entry_scan = now
-
-            except Exception as e:
-                # A persistent process must never die from one bad cycle -
-                # log it clearly and keep running, unlike a one-shot script
-                # where a crash just fails that single run.
-                log.error(f"💥 Cycle error (continuing): {e}")
-
-            time.sleep(EXIT_CHECK_SECONDS)
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    import sys
-    mode = sys.argv[1] if len(sys.argv) > 1 else "loop"
-
-    bot = FastballBot()
-    if mode == "once":
-        # Manual/cron-triggered single run: python fastball_bot.py once
-        bot.run_once()
-    else:
-        # Default: persistent loop for Railway or any always-on host
-        bot.run_forever()
+    main()
