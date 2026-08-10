@@ -42,6 +42,8 @@ KNOWN LIMITATIONS (first version — expect to iterate, same as the other bots):
 import os
 import time
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -86,6 +88,27 @@ option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
 # In-memory state — Alpaca's own positions are the source of truth on every
 # loop; this just tracks what we don't want to re-derive every cycle.
 state = {"traded_today": None, "position_side": None}
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Answers any request with 200 OK. Exists only so Railway's default
+    health check (which expects an HTTP port) doesn't mark this background
+    worker as unhealthy and kill it — this bot has no actual web traffic."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format, *args):
+        pass  # keep Railway's logs to our own log lines, not per-request noise
+
+
+def _start_health_server():
+    port = int(os.environ.get("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    log.info("Health check server listening on port %s", port)
+    server.serve_forever()
 
 
 def parse_hhmm(s: str):
@@ -277,6 +300,7 @@ def main():
         "Starting SuperTrend-at-open bot | underlying=%s factor=%s atr=%s paper=%s",
         UNDERLYING_SYMBOL, ST_MULTIPLIER, ST_ATR_PERIOD, PAPER,
     )
+    threading.Thread(target=_start_health_server, daemon=True).start()
     while True:
         try:
             clock = trading_client.get_clock()
